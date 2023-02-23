@@ -1,0 +1,244 @@
+import time
+import dbf
+from pathlib import Path
+import sys
+import glob
+import psycopg2
+from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+import logging
+from logging.handlers import RotatingFileHandler
+
+logging.basicConfig(filename="status.log", level=logging.INFO)
+logger = logging.getLogger(__name__)
+logger.propagate = False
+handler = RotatingFileHandler('errors.log', maxBytes=2000, backupCount=5)
+formatter = logging.Formatter('%(asctime)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+
+# import sys
+# user = sys.argv[1]
+# database = sys.argv[2]
+# host = sys.argv[3]
+
+
+def dbf2pg(user, db, host):
+    # LIST OF INTERESTED TABLES
+    tbls = ['c_conf', 'cont_prel_art', 'conturi', 'inch_cv', 'inchidere', 'registru', 'societ']
+
+    # SCRIPT START TIME
+    start = time.time()
+
+    # CREATE DATABASE IF NOT EXIST OR UPDATE IF EXIST
+    try:
+        conn = psycopg2.connect(user=user, host=host, database='salis',
+                                port="5432", client_encoding='utf8')
+        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+        cursor = conn.cursor()
+
+        # determine if DB exists(create a temporary DB)
+        cursor.execute(f"SELECT datname FROM pg_catalog.pg_database WHERE lower(datname) = lower('{db}')")
+
+        # get response
+        db_exists = cursor.fetchall()
+
+        # if response is an empty list(means DB not exists), create DB with given name
+        if not db_exists:
+            try:
+                # create DB
+                cursor.execute(f'CREATE DATABASE {db}')
+                cursor.execute(f"CREATE USER {db} WITH PASSWORD '{db}'")
+                logging.info(f" Database: {db} User: {db} Pass:{db}")
+
+
+            except (Exception, psycopg2.Error):
+                logger.error("Error 1 at DB creation!", exc_info=True)
+                cursor.close()
+                conn.close()
+                sys.exit()
+
+        # if response is not an empty list(means DB exists), create a new DB with DB_temp name
+        else:
+            db = db + "_temp"
+            try:
+                cursor.execute(f"DROP DATABASE IF EXISTS {db}")
+                cursor.execute(f'CREATE DATABASE {db}')
+            except (Exception, psycopg2.Error):
+                logger.error("Error 2 at DB creation!", exc_info=True)
+                cursor.close()
+                conn.close()
+                sys.exit()
+
+    except (Exception, psycopg2.Error):
+        logger.error("Error 3", exc_info=True)
+        sys.exit()
+
+    # finally:
+    #     if conn is not None:
+    #         conn.close()
+
+
+    # OPEN DB CONNECTION
+    try:
+        conn = psycopg2.connect(user=user, host=host, database=db,
+                                port="5432", client_encoding='utf8')
+    except (Exception, psycopg2.Error):
+        logger.error("Error 4 at database connection", exc_info=True)
+        conn = None
+
+    if conn is not None:
+        table_no = 0
+        cursor = conn.cursor()
+
+        # for path in glob.iglob(f'C:/Users/USER IT-04/Desktop/21-02-2020_0_/*.dbf'):
+        for path in glob.iglob(f'C:/Users/USER IT-04/Desktop/21-02-2020_0_/*.dbf'):
+            # for path in glob.iglob(f'{os.getcwd()}/*.dbf'):
+
+            # get table name from dbf
+            table_name = Path(path).stem
+            table = dbf.Table(str(path), codepage='mac_roman')
+            # table = dbf.Table(str(path), codepage='utf-8')
+
+            # if table name in list of interested table
+            for tb in tbls:
+                if tb == table_name:
+
+                    # open table
+                    table.open()
+
+                    try:
+                        # create table in DB
+                        cursor.execute(f"CREATE TABLE {table_name} ()")
+                        table_no += 1
+                    except (Exception, psycopg2.Error):
+                        logger.error("Error at table creation!", exc_info=True)
+
+                    for i in table.structure():
+                        # get column name
+                        column_name = i.split(' ')[0]
+
+                        # Change table name USER (Postgres name spaces conflict error)
+                        if column_name == "USER" or column_name == "user":
+                            column_name = "users"
+
+                        # get column data type
+                        column_type = i.split(' ')[1][0]
+
+                        # get column attribute
+                        column_attr = i.split(' ')[1][1::]
+
+                        # convert tables columns data types from FoxPro to Postgres
+                        try:
+                            if column_type == "N":
+                                # format tuple from string(get column attr)
+                                tp = tuple(int(num) for num in column_attr.replace('(', '').replace(')', '')
+                                           .replace('...', '').split(','))
+                                # data type length
+                                length = tp[0]
+
+                                # decimal length
+                                decimal_length = tp[1]
+
+                                # add int column
+                                if decimal_length == 0:
+                                    cursor.execute(
+                                        f"ALTER TABLE {table_name} ADD {column_name} BIGINT;")
+
+                                # or add decimal column
+                                else:
+                                    cursor.execute(
+                                        f"ALTER TABLE {table_name} ADD {column_name} NUMERIC({length},{decimal_length});")
+
+                            # add string columns
+                            elif column_type == "C":
+                                # format tuple from string(get column attr)
+                                tp = tuple(int(num) for num in column_attr.replace('(', '').replace(')', '')
+                                           .replace('...', '').split(','))
+
+                                # data type length
+                                length = tp[0]
+                                cursor.execute(f"ALTER TABLE {table_name} ADD {column_name} VARCHAR({length + 300});")
+
+                            elif column_type == 'D':
+                                cursor.execute(f"ALTER TABLE {table_name} ADD {column_name} DATE;")
+
+                            elif column_type == 'T':
+                                cursor.execute(f"ALTER TABLE {table_name} ADD {column_name} TIMESTAMP;")
+
+                            elif column_type == 'L':
+                                cursor.execute(f"ALTER TABLE {table_name} ADD {column_name} BOOLEAN;")
+
+                            elif column_type == 'G':
+                                cursor.execute(f"ALTER TABLE {table_name} ADD {column_name} VARCHAR(512);")
+
+                            elif column_type == 'M':
+                                cursor.execute(f"ALTER TABLE {table_name} ADD {column_name} VARCHAR(512);")
+
+                        except (Exception, psycopg2.Error):
+                            logger.error("Error at table setting data type!", exc_info=True)
+                            sys.exit()
+
+                    # get row value from dbf table
+                    values = [list(row) for row in table]
+
+                    # get columns number and add '%s' for every column(for INSERT query)
+                    columns = table.field_count * '%s, '
+
+                    # remove last ',' from cols
+                    columns_no = columns[0:-2]
+
+                    # insert data into table
+                    for data in values:
+                        for index, value in enumerate(data):
+                            # remove before and after spaces from data
+                            # replace null(\x00) with ''
+                            if type(value) == str:
+                                data[index] = value.strip().replace('\x00', '').replace('\r', '').replace('\n', '')
+                        try:
+                            cursor.execute(f"INSERT INTO {table_name} VALUES({columns_no})", data)
+                        except (Exception, psycopg2.Error) as err:
+                            logger.error(
+                                f'Error!" An error occured when try to insert data {data} in "{table_name} tabel" ->> {type(err)} - {err}')
+                            # close table
+                            table.close()
+                            cursor.close()
+                            conn.close()
+                            sys.exit()
+
+                            # rollback the previous transaction before starting another
+                            # conn.rollback()
+
+                    # close table
+                    table.close()
+
+        # commit
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        # if db_temp exist, delete old DB and rename new DB like old one
+        if "_temp" in db:
+            try:
+                conn = psycopg2.connect(user=user, host=host, database='salis',
+                                        port="5432", client_encoding='utf8')
+                conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+                cursor = conn.cursor()
+                db_initial = db[:-5]
+                cursor.execute(f"DROP DATABASE {db_initial}")
+                cursor.execute(f"ALTER DATABASE {db} RENAME TO {db_initial} ")
+                cursor.close()
+                conn.close()
+
+            except (Exception, psycopg2.Error):
+                logger.error("Error at database _temp", exc_info=True)
+                cursor.close()
+                conn.close()
+                sys.exit()
+
+        # SCRIPT END TIME
+        end = time.time()
+        logging.info(f"Database:{db} Working time {end - start} sec. Alter {table_no} table(s).")
+
+
+dbf2pg('user', 'db', 'host')
